@@ -6,7 +6,7 @@ import subprocess
 
 import cv2
 import numpy as np
-import torch
+import torch, face_detection
 from tqdm import tqdm
 
 import audio
@@ -16,49 +16,72 @@ from models import Wav2Lip
 from batch_face import RetinaFace
 from time import time
 
-parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
+import json
 
-parser.add_argument('--checkpoint_path', type=str, 
-                    help='Name of saved checkpoint to load weights from', required=True)
+args = {
+    'checkpoint_path': "D:/new/Wav2Lip/checkpoints/wav2lip_gan.pth",
+    'face': "D:/new/sample_data/uploaded.mp4",
+    'audio': "D:/new/translated_audio/translated.wav",
+    'outfile': "D:/new/converted_videos/output.mp4",
+    'static': False,
+    'fps': 25.,
+    'pads': [0, 10, 0, 0],
+    'face_det_batch_size': 16,
+    'wav2lip_batch_size': 128,
+    'resize_factor': 1,
+    'crop': [0, -1, 0, -1],
+    'box': [-1, -1, -1, -1],
+    'rotate': False,
+    'nosmooth': False,
+    'img_size': 96
+}
 
-parser.add_argument('--face', type=str, 
-                    help='Filepath of video/image that contains faces to use', required=True)
-parser.add_argument('--audio', type=str, 
-                    help='Filepath of video/audio file to use as raw audio source', required=True)
-parser.add_argument('--outfile', type=str, help='Video path to save result. See default for an e.g.', 
-                                default='results/result_voice.mp4')
+# Save the dictionary as a JSON file
+with open('args[json', 'w') as json_file:
+    json.dump(args, json_file)
 
-parser.add_argument('--static', type=bool, 
-                    help='If True, then use only first video frame for inference', default=False)
-parser.add_argument('--fps', type=float, help='Can be specified only if input is a static image (default: 25)', 
-                    default=25., required=False)
 
-parser.add_argument('--pads', nargs='+', type=int, default=[0, 10, 0, 0], 
-                    help='Padding (top, bottom, left, right). Please adjust to include chin at least')
+# def load_model(path):
+#     model = Wav2Lip()
+#     print("Load checkpoint from: {}".format(path))
+#     checkpoint = _load(path)
+#     s = checkpoint["state_dict"]
+#     new_s = {}
+#     for k, v in s.items():
+#         new_s[k.replace('module.', '')] = v
+#     model.load_state_dict(new_s)
 
-parser.add_argument('--wav2lip_batch_size', type=int, help='Batch size for Wav2Lip model(s)', default=128)
+#     model = model.to(device)
+#     return model.eval()
 
-parser.add_argument('--resize_factor', default=1, type=int,
-             help='Reduce the resolution by this factor. Sometimes, best results are obtained at 480p or 720p')
+# model = detector = detector_model = None
 
-parser.add_argument('--out_height', default=480, type=int,
-            help='Output video height. Best results are obtained at 480 or 720')
+# def do_load(checkpoint_path):
+#     global model, detector, detector_model
 
-parser.add_argument('--crop', nargs='+', type=int, default=[0, -1, 0, -1],
-                    help='Crop video to a smaller region (top, bottom, left, right). Applied after resize_factor and rotate arg. ' 
-                    'Useful if multiple face present. -1 implies the value will be auto-inferred based on height, width')
+#     model = load_model(checkpoint_path)
 
-parser.add_argument('--box', nargs='+', type=int, default=[-1, -1, -1, -1], 
-                    help='Specify a constant bounding box for the face. Use only as a last resort if the face is not detected.'
-                    'Also, might work only if the face is not moving around much. Syntax: (top, bottom, left, right).')
+#     # SFDDetector.load_model(device)
+#     detector = RetinaFace(gpu_id=0, model_path="checkpoints/mobilenet.pth", network="mobilenet")
+#     # detector = RetinaFace(gpu_id=0, model_path="checkpoints/resnet50.pth", network="resnet50")
 
-parser.add_argument('--rotate', default=False, action='store_true',
-                    help='Sometimes videos taken from a phone can be flipped 90deg. If true, will flip video right by 90deg.'
-                    'Use if you get a flipped result, despite feeding a normal looking video')
+#     detector_model = detector.model
 
-parser.add_argument('--nosmooth', default=False, action='store_true',
-                    help='Prevent smoothing face detections over a short temporal window')
+#     print("Models loaded")
 
+# face_batch_size = 64 * 8
+
+# def face_rect(images):
+#     num_batches = math.ceil(len(images) / face_batch_size)
+#     prev_ret = None
+#     for i in range(num_batches):
+#         batch = images[i * face_batch_size: (i + 1) * face_batch_size]
+#         all_faces = detector(batch)  # return faces list of all images
+#         for faces in all_faces:
+#             if faces:
+#                 box, landmarks, score = faces[0]
+#                 prev_ret = tuple(map(int, box))
+#             yield prev_ret
 
 def get_smoothened_boxes(boxes, T):
     for i in range(len(boxes)):
@@ -70,62 +93,82 @@ def get_smoothened_boxes(boxes, T):
     return boxes
 
 def face_detect(images):
+    detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D, 
+                                                flip_input=False, device=device)
+
+    batch_size = args['face_det_batch_size']
+    
+    while 1:
+        predictions = []
+        try:
+            for i in tqdm(range(0, len(images), batch_size)):
+                predictions.extend(detector.get_detections_for_batch(np.array(images[i:i + batch_size])))
+        except RuntimeError:
+            if batch_size == 1: 
+                raise RuntimeError('Image too big to run face detection on GPU. Please use the --resize_factor argument')
+            batch_size //= 2
+            print('Recovering from OOM error; New batch size: {}'.format(batch_size))
+            continue
+        break
+
     results = []
-    pady1, pady2, padx1, padx2 = args.pads
-
-    s = time()
-
-    for image, rect in zip(images, face_rect(images)):
+    pady1, pady2, padx1, padx2 = args['pads']
+    for rect, image in zip(predictions, images):
         if rect is None:
-            cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
-            raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
+            # Add the original frame without face to results
+            results.append([image, []])
+            # cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
+            # raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
 
         y1 = max(0, rect[1] - pady1)
         y2 = min(image.shape[0], rect[3] + pady2)
         x1 = max(0, rect[0] - padx1)
         x2 = min(image.shape[1], rect[2] + padx2)
-
+        
         results.append([x1, y1, x2, y2])
 
-    print('face detect time:', time() - s)
-
     boxes = np.array(results)
-    if not args.nosmooth: boxes = get_smoothened_boxes(boxes, T=5)
+    if not args['nosmooth']: boxes = get_smoothened_boxes(boxes, T=5)
     results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, boxes)]
-
-    return results
-
+    
+    del detector
+    return results 
 
 def datagen(frames, mels):
     img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
-    if args.box[0] == -1:
-        if not args.static:
+    if args['box'][0] == -1:
+        if not args['static']:
             face_det_results = face_detect(frames) # BGR2RGB for CNN face detection
         else:
             face_det_results = face_detect([frames[0]])
     else:
         print('Using the specified bounding box instead of face detection...')
-        y1, y2, x1, x2 = args.box
+        y1, y2, x1, x2 = args['box']
         face_det_results = [[f[y1: y2, x1:x2], (y1, y2, x1, x2)] for f in frames]
 
     for i, m in enumerate(mels):
-        idx = 0 if args.static else i%len(frames)
+        idx = 0 if args['static'] else i%len(frames)
         frame_to_save = frames[idx].copy()
         face, coords = face_det_results[idx].copy()
 
-        face = cv2.resize(face, (args.img_size, args.img_size))
+        if len(coords) == 0: # Check if there are no face coordinates
+            # Add a random matrix of shape (96x96x3) to img_batch and an empty list to coords_batch
+            face = np.random.rand(args['img_size'], args['img_size'], 3) * 255
+            coords_batch.append([])
+        else:
+            face = cv2.resize(face, (args['img_size'], args['img_size']))
 
         img_batch.append(face)
         mel_batch.append(m)
         frame_batch.append(frame_to_save)
-        coords_batch.append(coords)
+        # coords_batch.append(coords)
 
-        if len(img_batch) >= args.wav2lip_batch_size:
+        if len(img_batch) >= args['wav2lip_batch_size']:
             img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
 
             img_masked = img_batch.copy()
-            img_masked[:, args.img_size//2:] = 0
+            img_masked[:, args['img_size']//2:] = 0
 
             img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
             mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
@@ -137,7 +180,7 @@ def datagen(frames, mels):
         img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
 
         img_masked = img_batch.copy()
-        img_masked[:, args.img_size//2:] = 0
+        img_masked[:, args['img_size']//2:] = 0
 
         img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
         mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
@@ -157,33 +200,36 @@ def _load(checkpoint_path):
     return checkpoint
 
 def load_model(path):
-    model = Wav2Lip()
-    print("Load checkpoint from: {}".format(path))
-    checkpoint = _load(path)
-    s = checkpoint["state_dict"]
-    new_s = {}
-    for k, v in s.items():
-        new_s[k.replace('module.', '')] = v
-    model.load_state_dict(new_s)
+	model = Wav2Lip()
+	print("Load checkpoint from: {}".format(path))
+	checkpoint = _load(path)
+	s = checkpoint["state_dict"]
+	new_s = {}
+	for k, v in s.items():
+		new_s[k.replace('module.', '')] = v
+	model.load_state_dict(new_s)
 
-    model = model.to(device)
-    return model.eval()
+	model = model.to(device)
+	return model.eval()
 
-def main():
-    args.img_size = 96
+def convert(audio_file, video_file, checkpoint_path, final_output_directory):
+    args['face'] = video_file
+    args['audio'] = audio_file
+    args['checkpoint_path'] = checkpoint_path
+    print("generating video")
 
-    if os.path.isfile(args.face) and args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
-        args.static = True
+    if os.path.isfile(args['face']) and args['face'].split('.')[1] in ['jpg', 'png', 'jpeg']:
+        args['static'] = True
 
-    if not os.path.isfile(args.face):
+    if not os.path.isfile(args['face']):
         raise ValueError('--face argument must be a valid path to video/image file')
 
-    elif args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
-        full_frames = [cv2.imread(args.face)]
-        fps = args.fps
+    elif args['face'].split('.')[1] in ['jpg', 'png', 'jpeg']:
+        full_frames = [cv2.imread(args['face'])]
+        fps = args['fps']
 
     else:
-        video_stream = cv2.VideoCapture(args.face)
+        video_stream = cv2.VideoCapture(args['face'])
         fps = video_stream.get(cv2.CAP_PROP_FPS)
 
         print('Reading video frames...')
@@ -195,15 +241,15 @@ def main():
                 video_stream.release()
                 break
 
-            aspect_ratio = frame.shape[1] / frame.shape[0]
-            frame = cv2.resize(frame, (int(args.out_height * aspect_ratio), args.out_height))
-            # if args.resize_factor > 1:
-            #     frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
+            # aspect_ratio = frame.shape[1] / frame.shape[0]
+            # frame = cv2.resize(frame, (int(args['out_height'] * aspect_ratio), args['out_height']))
+            if args['resize_factor'] > 1:
+                frame = cv2.resize(frame, (frame.shape[1]//args['resize_factor'], frame.shape[0]//args['resize_factor']))
 
-            if args.rotate:
+            if args['rotate']:
                 frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
 
-            y1, y2, x1, x2 = args.crop
+            y1, y2, x1, x2 = args['crop']
             if x2 == -1: x2 = frame.shape[1]
             if y2 == -1: y2 = frame.shape[0]
 
@@ -213,18 +259,18 @@ def main():
 
     print ("Number of frames available for inference: "+str(len(full_frames)))
 
-    if not args.audio.endswith('.wav'):
+    if not args['audio'].endswith('.wav'):
         print('Extracting raw audio...')
-        # command = 'ffmpeg -y -i {} -strict -2 {}'.format(args.audio, 'temp/temp.wav')
+        # command = 'ffmpeg -y -i {} -strict -2 {}'.format(args[audio, 'temp/temp.wav')
         # subprocess.call(command, shell=True)
         subprocess.check_call([
             "ffmpeg", "-y",
-            "-i", args.audio,
+            "-i", args['audio'],
             "temp/temp.wav",
         ])
-        args.audio = 'temp/temp.wav'
+        args['audio'] = 'temp/temp.wav'
 
-    wav = audio.load_wav(args.audio, 16000)
+    wav = audio.load_wav(args['audio'], 16000)
     mel = audio.melspectrogram(wav)
     print(mel.shape)
 
@@ -245,15 +291,20 @@ def main():
     print("Length of mel chunks: {}".format(len(mel_chunks)))
 
     full_frames = full_frames[:len(mel_chunks)]
-
-    batch_size = args.wav2lip_batch_size
+    batch_size = args['wav2lip_batch_size']
     gen = datagen(full_frames.copy(), mel_chunks)
 
     s = time()
+    for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
+											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
 
-    for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen,
-                                            total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
+    # for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen,
+    #                                         total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
+        
         if i == 0:
+            model = load_model(args['checkpoint_path'])
+			# print ("Model loaded")
+
             frame_h, frame_w = full_frames[0].shape[:-1]
             out = cv2.VideoWriter('temp/result.avi',
                                     cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
@@ -268,56 +319,24 @@ def main():
 
         for p, f, c in zip(pred, frames, coords):
             y1, y2, x1, x2 = c
-            p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-
-            f[y1:y2, x1:x2] = p
-            out.write(f)
-
+            if len(c) == 0:  # Check if there are no face coordinates (no face detected)
+                out.write(f)  # Write the original frame without lip-syncing
+            else:
+                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+                f[y1:y2, x1:x2] = p
+                out.write(f)  
+           
     out.release()
-
+    ffmpeg_path = "D:/new/Wav2Lip/ffmpeg.exe"
     print("wav2lip prediction time:", time() - s)
+    command = '{} -y -i {} -i {} -strict -2 -q:v 1 {}'.format(ffmpeg_path,args['audio'], 'temp/result.avi', final_output_directory)
+    subprocess.call(command, shell=platform.system() != 'Windows')
+    # subprocess.check_call([
+    #     "ffmpeg", "-y",
+    #     # "-vsync", "0", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+    #     "-i", "temp/result.avi",
+    #     "-i", args['audio'],
+    #     # "-c:v", "h264_nvenc",
+    #     args['outfile'],
+    # ])
 
-    subprocess.check_call([
-        "ffmpeg", "-y",
-        # "-vsync", "0", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
-        "-i", "temp/result.avi",
-        "-i", args.audio,
-        # "-c:v", "h264_nvenc",
-        args.outfile,
-    ])
-
-model = detector = detector_model = None
-
-def do_load(checkpoint_path):
-    global model, detector, detector_model
-
-    model = load_model(checkpoint_path)
-
-    # SFDDetector.load_model(device)
-    detector = RetinaFace(gpu_id=0, model_path="checkpoints/mobilenet.pth", network="mobilenet")
-    # detector = RetinaFace(gpu_id=0, model_path="checkpoints/resnet50.pth", network="resnet50")
-
-    detector_model = detector.model
-
-    print("Models loaded")
-
-
-face_batch_size = 64 * 8
-
-def face_rect(images):
-    num_batches = math.ceil(len(images) / face_batch_size)
-    prev_ret = None
-    for i in range(num_batches):
-        batch = images[i * face_batch_size: (i + 1) * face_batch_size]
-        all_faces = detector(batch)  # return faces list of all images
-        for faces in all_faces:
-            if faces:
-                box, landmarks, score = faces[0]
-                prev_ret = tuple(map(int, box))
-            yield prev_ret
-
-
-if __name__ == '__main__':
-    args = parser.parse_args()
-    do_load(args.checkpoint_path)
-    main()
