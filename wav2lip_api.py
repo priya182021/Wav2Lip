@@ -1,6 +1,11 @@
-from flask import Flask, request
+from flask import Flask, request, render_template 
+import inferenc
 
 app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
 
 @app.route('/wav2lip', methods=['POST'])
 def process_wav2lip():
