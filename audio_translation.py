@@ -4,7 +4,7 @@ import speech_recognition as sr
 from translate import Translator
 import os
 from deep_translator import GoogleTranslator
-from deep_translator import PonsTranslator
+# from deep_translator import PonsTranslator
 
 
 def translate(language,audio_output_path):
